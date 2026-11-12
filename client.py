@@ -1,15 +1,7 @@
 """
 Kommandozeilen-Client für den Messenger (app.py).
 
-Installation:   pip install requests python-escpos pyusb
-Start:          python client.py                       (fragt Benutzername/Passwort ab)
-                python client.py --url http://13.49.225.2:5874 --user benkormos
-                (Passwort optional über die Umgebungsvariable MESSENGER_PASSWORD)
-
-Bondrucker: Eingehende Nachrichten anderer werden automatisch auf dem Epson TM-T88V
-(USB 04b8:0e02) ausgedruckt. Andere Geräte:  --usb VVVV:PPPP    Ausschalten:  --no-print
-Windows: dem Drucker per Zadig den WinUSB/libusb-Treiber geben (sonst findet pyusb ihn nicht).
-Linux: Zugriff per udev-Regel erlauben oder mit sudo starten.
+Installation:   pip install requests
 
 Befehle:
     #kanal              Kanal im aktuellen Server wechseln  ("#" allein = Kanalliste)
@@ -34,8 +26,6 @@ import base64
 import getpass
 import json
 import os
-import queue
-import re
 import sys
 import threading
 import zlib
@@ -87,88 +77,6 @@ def pick(items, key, query):
     return []
 
 
-def printable(text):
-    """Emojis und Steuerzeichen entfernen, die der Bondrucker nicht drucken kann."""
-    text = re.sub(r"[\U00010000-\U0010FFFF\u200d\ufe0f\u2600-\u27bf]", "", text or "")
-    return "".join(ch for ch in text if ch == "\n" or ch.isprintable())
-
-
-class ReceiptPrinter:
-    """Druckt eingehende Nachrichten per USB auf einem ESC/POS-Bondrucker (Epson TM-T88V)."""
-
-    def __init__(self, vendor, product, on_error=None):
-        self.vendor, self.product, self.on_error = vendor, product, on_error
-        self.printer = None
-        self.last_error = None
-        self.jobs = queue.Queue()
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def connect(self):
-        if self.printer is not None:
-            return
-        try:
-            from escpos.printer import Usb
-        except ImportError:
-            raise RuntimeError("python-escpos fehlt:  pip install python-escpos pyusb")
-        self.printer = Usb(self.vendor, self.product, profile="TM-T88V")
-
-    def close(self):
-        try:
-            self.printer.close()
-        except Exception:
-            pass
-        self.printer = None
-
-    def test(self):
-        try:
-            self.connect()
-            return True, "Bondrucker verbunden."
-        except Exception as e:
-            self.close()
-            return False, f"Bondrucker nicht erreichbar ({e or e.__class__.__name__}) – es wird bei jeder Nachricht erneut versucht."
-
-    def submit(self, where, name, when, text):
-        self.jobs.put((where, name, when, text))
-
-    def _print(self, job):
-        where, name, when, text = (printable(x) for x in job)
-        p = self.printer
-        p.set(align="center", bold=True)
-        p.text(where + "\n")
-        p.set(align="left", bold=False)
-        p.text(when + "\n")
-        p.set(align="left", bold=True)
-        p.text(name + ":\n")
-        p.set(align="left", bold=False)
-        p.text(text + "\n\n")
-        p.cut()
-
-    def _loop(self):
-        while True:
-            job = self.jobs.get()
-            for attempt in (0, 1):                   # bei Fehler einmal neu verbinden
-                try:
-                    self.connect()
-                    self._print(job)
-                    self.last_error = None
-                    break
-                except Exception as e:
-                    self.close()
-                    if attempt:
-                        msg = str(e) or e.__class__.__name__
-                        if msg != self.last_error and self.on_error:
-                            self.on_error(f"Drucken fehlgeschlagen: {msg}")
-                        self.last_error = msg
-
-
-def media_tag(m):
-    if not m.get("media"):
-        return ""
-    kind = {"image": "Bild", "video": "Video", "audio": "Audio"}.get(m.get("media_type"), "Datei")
-    size = fmt_size(m.get("media_size"))
-    return f"[{kind}: {m.get('media_name') or 'Anhang'}{', ' + size if size else ''}]"
-
-
 class Client:
     def __init__(self, base):
         self.base = base.rstrip("/")
@@ -188,7 +96,6 @@ class Client:
         self.gen = 0
         self.act_last = 0
         self.loaded = False             # erste Ladung der Ansicht abgeschlossen?
-        self.printer = None
 
     # ------------------------------------------------------------ Ausgabe
     def prompt(self):
@@ -300,11 +207,6 @@ class Client:
                 if m["id"] > self.last_id:
                     lines += self.fmt_msg(m)
                     self.last_id = m["id"]
-                    if self.printer and not first and m["username"].lower() != self.username.lower():
-                        dt = parse_ts(m.get("created_at"))
-                        self.printer.submit(self.label, m["username"],
-                                            dt.strftime("%d.%m.%Y %H:%M") if dt else "",
-                                            "\n".join(x for x in ((m.get("body") or ""), media_tag(m)) if x))
             if lines:
                 (self.notify if background else self.say)("\n".join(lines))
 
@@ -478,8 +380,6 @@ class Client:
                      if it["channel_id"] else "DM")
             ping = " @DU" if it["mention"] else ""
             self.notify(f"{YELLOW}[neu{ping}] {where} – {it['username']}: {it['preview']}{RESET}")
-            if self.printer:
-                self.printer.submit(where, it["username"], datetime.now().strftime("%d.%m.%Y %H:%M"), it["preview"])
 
     def poll_loop(self):
         warned = False
@@ -555,10 +455,8 @@ class Client:
 
 def main():
     ap = argparse.ArgumentParser(description="Messenger-Client für die Kommandozeile")
-    ap.add_argument("--url", default=os.environ.get("MESSENGER_URL", "http://192.168.2.227:5874"))
+    ap.add_argument("--url", default=os.environ.get("MESSENGER_URL", "http://13.49.225.2:5874"))
     ap.add_argument("--user")
-    ap.add_argument("--usb", default="04b8:0e02", help="USB-ID des Bondruckers (Standard: Epson TM-T88V)")
-    ap.add_argument("--no-print", action="store_true", help="Bondrucker deaktivieren")
     args = ap.parse_args()
 
     os.system("")   # aktiviert ANSI-Farben in der Windows-Konsole
@@ -574,13 +472,6 @@ def main():
         c.load_server(c.servers[0]["id"])       # Hauptserver, erster Kanal
     except ApiError as e:
         sys.exit(f"Fehler: {e}")
-    if not args.no_print:
-        try:
-            vid, pid = (int(x, 16) for x in args.usb.split(":"))
-        except ValueError:
-            sys.exit("--usb muss das Format VVVV:PPPP haben, z. B. 04b8:0e02")
-        c.printer = ReceiptPrinter(vid, pid, on_error=lambda m: c.notify(f"{RED}{m}{RESET}"))
-        print(c.printer.test()[1])
     c.run()
 
 
